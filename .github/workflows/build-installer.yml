@@ -1,0 +1,124 @@
+name: build-installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "**/*"
+      - ".github/workflows/build-installer.yml"
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_REPOSITORY: SWAddins/swaa
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+
+      - name: Restore + Build Addin
+        run: msbuild SWAutoAttributes.sln /restore /p:Configuration=Release
+
+      - name: Build Installer
+        shell: pwsh
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer\SWAutoAttributes.iss"'
+
+      - name: Prepare Artifact Metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $installerPath = "installer\SW_Auto_Attributes_Setup.exe"
+          $versionInfo = (Get-Item $installerPath).VersionInfo
+          $rawVersion = $versionInfo.ProductVersion
+          if ([string]::IsNullOrWhiteSpace($rawVersion)) {
+            $rawVersion = $versionInfo.FileVersion
+          }
+          if ([string]::IsNullOrWhiteSpace($rawVersion)) {
+            throw "Cannot read version from $installerPath"
+          }
+          $version = ($rawVersion -replace '[^0-9A-Za-z\.\-_]', '').Trim('.')
+          $tag = "v$version"
+          $releaseName = "v$version"
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "release_name=$releaseName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: SW_Auto_Attributes_Setup_v${{ steps.meta.outputs.version }}
+          path: installer\SW_Auto_Attributes_Setup.exe
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Installer Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: SW_Auto_Attributes_Setup_v${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: Move Release Tag To Current Commit
+        uses: actions/github-script@v7
+        env:
+          TAG_NAME: ${{ needs.build.outputs.tag }}
+          TARGET_SHA: ${{ github.sha }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tag = process.env.TAG_NAME;
+            const sha = process.env.TARGET_SHA;
+            const ref = `tags/${tag}`;
+
+            try {
+              await github.rest.git.getRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref,
+              });
+              await github.rest.git.updateRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref,
+                sha,
+                force: true,
+              });
+            } catch (error) {
+              if (error.status === 404) {
+                await github.rest.git.createRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: `refs/${ref}`,
+                  sha,
+                });
+              } else {
+                throw error;
+              }
+            }
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ env.RELEASE_REPOSITORY }}
+          tag_name: ${{ needs.build.outputs.tag }}
+          name: ${{ needs.build.outputs.release_name }}
+          generate_release_notes: false
+          body: ""
+          overwrite_files: true
+          files: dist/SW_Auto_Attributes_Setup.exe
